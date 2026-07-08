@@ -223,10 +223,27 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # -----------------------------------------------------------------------
-    # Model — random init from config
+    # Model — random init or resume from checkpoint
     # -----------------------------------------------------------------------
+    resume_step = 0
+    resume_dir = None
+    ckpt_root = Path(args.output_dir)
+    if ckpt_root.exists():
+        existing = sorted(
+            [d for d in ckpt_root.iterdir() if d.is_dir() and d.name.startswith("step-")],
+            key=lambda d: int(d.name.split("-")[1]),
+        )
+        if existing and (existing[-1] / "optimizer.pt").exists():
+            resume_dir = existing[-1]
+            resume_step = int(resume_dir.name.split("-")[1])
+
     config = LlamaConfig(**MODEL_CONFIG)
-    model = LlamaForCausalLM(config)
+    if resume_dir:
+        if is_main:
+            print(f"Resuming from checkpoint: {resume_dir} (step {resume_step})", flush=True)
+        model = LlamaForCausalLM.from_pretrained(resume_dir)
+    else:
+        model = LlamaForCausalLM(config)
 
     param_count = sum(p.numel() for p in model.parameters())
     if is_main:
@@ -286,6 +303,13 @@ def main():
     # -----------------------------------------------------------------------
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
+    if resume_dir and (resume_dir / "optimizer.pt").exists():
+        opt_state = torch.load(resume_dir / "optimizer.pt", map_location=device, weights_only=True)
+        optimizer.load_state_dict(opt_state)
+        del opt_state
+        if is_main:
+            print(f"Optimizer state loaded from {resume_dir}", flush=True)
+
     # TensorBoard
     if is_main:
         os.makedirs(args.tensorboard_dir, exist_ok=True)
@@ -297,8 +321,8 @@ def main():
     if is_main:
         print(f"\nStarting training...", flush=True)
 
-    global_step = 0
-    tokens_seen = 0
+    global_step = resume_step
+    tokens_seen = resume_step * tokens_per_step
     running_loss = 0.0
     start_time = time.time()
     log_start_time = time.time()
@@ -306,8 +330,17 @@ def main():
 
     data_iter = iter(dataloader)
 
-    if is_main:
-        print("Waiting for first batch...", flush=True)
+    if resume_step > 0 and is_main:
+        print(f"Fast-forwarding data to step {resume_step}...", flush=True)
+    batches_to_skip = resume_step * args.gradient_accumulation_steps
+    for _ in range(batches_to_skip):
+        try:
+            next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            next(data_iter)
+    if resume_step > 0 and is_main:
+        print(f"Data fast-forward complete, resuming training.", flush=True)
 
     while global_step < total_steps:
         # Set learning rate
@@ -375,7 +408,7 @@ def main():
         if global_step % args.save_interval == 0:
             save_dir = Path(args.output_dir) / f"step-{global_step}"
             if is_main:
-                print(f"Saving checkpoint to {save_dir}")
+                print(f"Saving checkpoint to {save_dir}", flush=True)
             accelerator.wait_for_everyone()
             unwrapped = accelerator.unwrap_model(model)
             if is_main:
@@ -384,6 +417,7 @@ def main():
                     safe_serialization=True,
                 )
                 tokenizer.save_pretrained(save_dir)
+                torch.save(optimizer.state_dict(), save_dir / "optimizer.pt")
             accelerator.wait_for_everyone()
 
     # -----------------------------------------------------------------------
