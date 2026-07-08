@@ -7,7 +7,7 @@ metadata:
     app: soyr-redhat-erebus-v2
     owner: soyr-redhat
 spec:
-  backoffLimit: 3
+  backoffLimit: 10
   template:
     metadata:
       labels:
@@ -49,6 +49,12 @@ spec:
               value: "false"
             - name: NCCL_DEBUG
               value: "WARN"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+              value: "600"
+            - name: TORCH_NCCL_BLOCKING_WAIT
+              value: "0"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: TRITON_CACHE_DIR
