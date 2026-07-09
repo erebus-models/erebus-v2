@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: soyr-redhat-erebus-v2-data-prep
+  namespace: machine-learning
+  labels:
+    app: soyr-redhat-erebus-v2
+    owner: soyr-redhat
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app: soyr-redhat-erebus-v2
+        owner: soyr-redhat
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: data-prep
+          image: image-registry.openshift-image-registry.svc:5000/machine-learning/erebus-v2:latest
+          command: ["python3"]
+          args:
+            - "scripts/prepare_data.py"
+            - "--output_dir=/dataset/tokenized"
+            - "--tokenizer=NousResearch/Llama-2-7b-hf"
+          env:
+            - name: HF_HOME
+              value: /dataset/hf_cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: soyr-redhat-erebus-v2-secrets
+                  key: hf-token
+                  optional: true
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              cpu: "16"
+              memory: 64Gi
+          volumeMounts:
+            - name: dataset
+              mountPath: /dataset
+      volumes:
+        - name: dataset
+          persistentVolumeClaim:
+            claimName: soyr-redhat-erebus-v2-dataset

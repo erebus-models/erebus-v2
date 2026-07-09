@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: soyr-redhat-erebus-v2-dataset
+  namespace: machine-learning
+  labels:
+    app: soyr-redhat-erebus-v2
+    owner: soyr-redhat
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ocs-storagecluster-cephfs-tier2
+  resources:
+    requests:
+      storage: 200Gi
