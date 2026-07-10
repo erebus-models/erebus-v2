@@ -43,8 +43,8 @@ SOURCES = [
     },
     {
         "name": "python-edu",
-        "dataset": "HuggingFaceTB/smollm-corpus",
-        "subset": "python-edu",
+        "dataset": "Avelina/python-edu-cleaned",
+        "subset": None,
         "split": "train",
         "text_field": "text",
         "target_tokens": 1_000_000_000,
@@ -67,13 +67,15 @@ def tokenize_and_save(source, tokenizer, output_dir, buffer_size=50_000_000):
             return existing_tokens
 
     print(f"[{name}] Loading dataset: {source['dataset']} / {source['subset']}", flush=True)
-    ds = load_dataset(
-        source["dataset"],
-        name=source["subset"],
+    load_kwargs = dict(
+        path=source["dataset"],
         split=source["split"],
         streaming=True,
         trust_remote_code=True,
     )
+    if source["subset"]:
+        load_kwargs["name"] = source["subset"]
+    ds = load_dataset(**load_kwargs)
 
     eos_id = tokenizer.eos_token_id
     token_buffer = np.empty(buffer_size, dtype=np.uint16)

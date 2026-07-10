@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: soyr-redhat-erebus-v2-train
+  name: soyr-redhat-erebus-v2-1.5b-train
   namespace: machine-learning
   labels:
     app: soyr-redhat-erebus-v2
@@ -15,7 +15,6 @@ spec:
         owner: soyr-redhat
     spec:
       restartPolicy: OnFailure
-      # Pin to A100 nodes
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -36,7 +35,15 @@ spec:
             - "--output_dir=/data/checkpoints"
             - "--tensorboard_dir=/data/logs"
             - "--data_dir=/dataset/tokenized"
-            - "--hf_repo=soyrsoyr/erebus-v2-500m-base"
+            - "--hidden_size=2048"
+            - "--intermediate_size=5504"
+            - "--num_hidden_layers=32"
+            - "--num_attention_heads=32"
+            - "--num_key_value_heads=8"
+            - "--per_device_batch_size=8"
+            - "--gradient_accumulation_steps=8"
+            - "--learning_rate=2e-4"
+            - "--hf_repo=soyrsoyr/erebus-v2-1.5b-base"
           env:
             - name: HF_HOME
               value: /data/hf_cache
@@ -82,7 +89,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: soyr-redhat-erebus-v2-data
+            claimName: soyr-redhat-erebus-v2-1.5b-data
         - name: dataset
           persistentVolumeClaim:
             claimName: soyr-redhat-erebus-v2-dataset

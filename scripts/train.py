@@ -15,6 +15,7 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
@@ -30,16 +31,20 @@ from transformers import (
 
 
 # ---------------------------------------------------------------------------
-# Model config — ~495M params with 32K vocab
+# Model config defaults — ~495M params with 32K vocab
+# Override via CLI: --hidden_size=2048 --num_hidden_layers=32 etc.
 # ---------------------------------------------------------------------------
-MODEL_CONFIG = dict(
+MODEL_DEFAULTS = dict(
     hidden_size=1536,
-    intermediate_size=4096,  # SwiGLU 2/3 scaling: int(2*4*1536/3) = 4096
+    intermediate_size=4096,
     num_hidden_layers=18,
     num_attention_heads=16,
-    num_key_value_heads=4,   # GQA 4:1
-    vocab_size=32000,        # Llama 2 tokenizer
+    num_key_value_heads=4,
+    vocab_size=32000,
     max_position_embeddings=2048,
+)
+
+MODEL_FIXED = dict(
     rms_norm_eps=1e-5,
     hidden_act="silu",
     tie_word_embeddings=True,
@@ -56,8 +61,8 @@ MODEL_CONFIG = dict(
 TRAIN_DEFAULTS = dict(
     total_tokens=10_000_000_000,  # 10B tokens
     seq_len=2048,
-    per_device_batch_size=8,      # sequences per GPU per micro-step
-    gradient_accumulation_steps=16, # effective batch = 8 * 4 GPUs * 16 = 512 seqs
+    per_device_batch_size=16,      # sequences per GPU per micro-step
+    gradient_accumulation_steps=8,  # effective batch = 16 * 4 GPUs * 8 = 512 seqs
     learning_rate=3e-4,
     min_lr_ratio=0.1,
     warmup_ratio=0.01,            # 1% of steps for warmup
@@ -79,6 +84,7 @@ TRAIN_DEFAULTS = dict(
     tokenizer_name="NousResearch/Llama-2-7b-hf",
     output_dir="./checkpoints",
     tensorboard_dir="./logs",
+    data_dir=None,  # path to pre-tokenized .bin files (overrides HF streaming)
     hf_repo=None,  # e.g. "soyrsoyr/erebus-v2-500m-base"
 )
 
@@ -155,6 +161,70 @@ class PackedTextDataset(IterableDataset):
 
 
 # ---------------------------------------------------------------------------
+# Disk-based packed dataset (reads pre-tokenized .bin files)
+# ---------------------------------------------------------------------------
+class DiskPackedDataset(IterableDataset):
+    """Reads pre-tokenized uint16 binary files from disk.
+
+    Expects a manifest.txt with lines: "filename.bin\\ttoken_count".
+    Shuffles all sequences deterministically, shards across DDP ranks and
+    DataLoader workers, and supports fast resume via skip_sequences.
+    """
+
+    def __init__(self, data_dir, seq_len, dp_rank=0, dp_world_size=1,
+                 seed=42, skip_sequences=0):
+        self.seq_len = seq_len
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        self.seed = seed
+        self.skip_sequences = skip_sequences
+        self.stride = seq_len + 1
+
+        manifest_path = Path(data_dir) / "manifest.txt"
+        self.mmaps = []
+        self.seq_counts = []
+
+        for line in manifest_path.read_text().strip().split("\n"):
+            fname, count = line.split("\t")
+            fpath = Path(data_dir) / fname
+            data = np.memmap(fpath, dtype=np.uint16, mode="r")
+            self.mmaps.append(data)
+            self.seq_counts.append(len(data) // self.stride)
+
+        self.cum_seqs = np.cumsum([0] + self.seq_counts)
+        self.total_sequences = int(self.cum_seqs[-1])
+
+    def _get_sequence(self, global_idx):
+        file_idx = int(np.searchsorted(self.cum_seqs[1:], global_idx, side="right"))
+        local_idx = global_idx - int(self.cum_seqs[file_idx])
+        offset = local_idx * self.stride
+        chunk = self.mmaps[file_idx][offset:offset + self.stride]
+        return chunk
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        rng = np.random.RandomState(self.seed)
+        indices = rng.permutation(self.total_sequences)
+
+        total_shards = self.dp_world_size * num_workers
+        shard_id = self.dp_rank * num_workers + worker_id
+        shard_indices = indices[shard_id::total_shards]
+
+        if self.skip_sequences > 0:
+            skip_per_worker = self.skip_sequences // num_workers
+            shard_indices = shard_indices[skip_per_worker:]
+
+        for idx in shard_indices:
+            chunk = self._get_sequence(idx)
+            input_ids = torch.tensor(chunk[:-1].astype(np.int64), dtype=torch.long)
+            labels = torch.tensor(chunk[1:].astype(np.int64), dtype=torch.long)
+            yield {"input_ids": input_ids, "labels": labels}
+
+
+# ---------------------------------------------------------------------------
 # Learning rate schedule — cosine with warmup
 # ---------------------------------------------------------------------------
 def get_lr(step, total_steps, warmup_steps, max_lr, min_lr):
@@ -177,7 +247,12 @@ def main():
             parser.add_argument(f"--{key}", action="store_true", default=default)
         else:
             parser.add_argument(f"--{key}", type=arg_type, default=default)
+    for key, default in MODEL_DEFAULTS.items():
+        parser.add_argument(f"--{key}", type=type(default), default=default)
     args = parser.parse_args()
+
+    MODEL_CONFIG = {k: getattr(args, k) for k in MODEL_DEFAULTS}
+    MODEL_CONFIG.update(MODEL_FIXED)
 
     # Accelerator handles DDP + mixed precision
     accelerator = Accelerator(
@@ -238,12 +313,17 @@ def main():
             resume_step = int(resume_dir.name.split("-")[1])
 
     config = LlamaConfig(**MODEL_CONFIG)
+    config._attn_implementation = "flash_attention_2"
     if resume_dir:
         if is_main:
             print(f"Resuming from checkpoint: {resume_dir} (step {resume_step})", flush=True)
-        model = LlamaForCausalLM.from_pretrained(resume_dir)
+        model = LlamaForCausalLM.from_pretrained(
+            resume_dir,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+        )
     else:
-        model = LlamaForCausalLM(config)
+        model = LlamaForCausalLM(config).to(torch.bfloat16)
 
     param_count = sum(p.numel() for p in model.parameters())
     if is_main:
@@ -255,16 +335,30 @@ def main():
     # -----------------------------------------------------------------------
     # Dataset & dataloader
     # -----------------------------------------------------------------------
-    dataset = PackedTextDataset(
-        tokenizer=tokenizer,
-        seq_len=args.seq_len,
-        dataset_name=args.dataset_name,
-        dataset_subset=args.dataset_subset,
-        min_edu_score=args.min_edu_score,
-        dp_rank=accelerator.process_index,
-        dp_world_size=accelerator.num_processes,
-        seed=args.seed,
-    )
+    skip_sequences = resume_step * args.per_device_batch_size * args.gradient_accumulation_steps
+
+    if args.data_dir:
+        if is_main:
+            print(f"Using disk-based dataset from {args.data_dir}", flush=True)
+        dataset = DiskPackedDataset(
+            data_dir=args.data_dir,
+            seq_len=args.seq_len,
+            dp_rank=accelerator.process_index,
+            dp_world_size=accelerator.num_processes,
+            seed=args.seed,
+            skip_sequences=skip_sequences,
+        )
+    else:
+        dataset = PackedTextDataset(
+            tokenizer=tokenizer,
+            seq_len=args.seq_len,
+            dataset_name=args.dataset_name,
+            dataset_subset=args.dataset_subset,
+            min_edu_score=args.min_edu_score,
+            dp_rank=accelerator.process_index,
+            dp_world_size=accelerator.num_processes,
+            seed=args.seed,
+        )
 
     dataloader = DataLoader(
         dataset,
@@ -330,17 +424,20 @@ def main():
 
     data_iter = iter(dataloader)
 
-    if resume_step > 0 and is_main:
-        print(f"Fast-forwarding data to step {resume_step}...", flush=True)
-    batches_to_skip = resume_step * args.gradient_accumulation_steps
-    for _ in range(batches_to_skip):
-        try:
-            next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            next(data_iter)
-    if resume_step > 0 and is_main:
-        print(f"Data fast-forward complete, resuming training.", flush=True)
+    if resume_step > 0 and not args.data_dir:
+        if is_main:
+            print(f"Fast-forwarding data to step {resume_step}...", flush=True)
+        batches_to_skip = resume_step * args.gradient_accumulation_steps
+        for _ in range(batches_to_skip):
+            try:
+                next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                next(data_iter)
+        if is_main:
+            print(f"Data fast-forward complete, resuming training.", flush=True)
+    elif resume_step > 0 and is_main:
+        print(f"Disk dataset handles resume internally, skipping {skip_sequences:,} sequences.", flush=True)
 
     while global_step < total_steps:
         # Set learning rate
